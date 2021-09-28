@@ -550,7 +550,7 @@ func (t gcTrigger) test() bool {
 		// own write.
 		return gcController.heapLive >= gcController.trigger
 	case gcTriggerTime:
-		if gcController.gcPercent < 0 {
+		if gcController.gcPercent < 0 && gcController.maxHeap == ^uintptr(0) {
 			return false
 		}
 		lastgc := int64(atomic.Load64(&memstats.last_gc_nanotime))
@@ -975,7 +975,13 @@ func gcMarkTermination(nextTriggerRatio float64) {
 	memstats.last_heap_inuse = memstats.heap_inuse
 
 	// Update GC trigger and pacing for the next cycle.
-	gcController.commit(nextTriggerRatio)
+	var updated bool
+	systemstack(func() {
+		updated = gcController.commit(nextTriggerRatio)
+	})
+	if updated {
+		gcController.policyNotify()
+	}
 
 	// Update timing memstats
 	now := nanotime()
