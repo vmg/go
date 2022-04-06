@@ -75,6 +75,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"runtime/causalprof"
 )
 
 func init() {
@@ -83,6 +85,7 @@ func init() {
 	http.HandleFunc("/debug/pprof/profile", Profile)
 	http.HandleFunc("/debug/pprof/symbol", Symbol)
 	http.HandleFunc("/debug/pprof/trace", Trace)
+	http.HandleFunc("/debug/pprof/causalprof", CausalProfile)
 }
 
 // Cmdline responds with the running program's
@@ -141,6 +144,30 @@ func Profile(w http.ResponseWriter, r *http.Request) {
 	}
 	sleep(r, time.Duration(sec)*time.Second)
 	pprof.StopCPUProfile()
+}
+
+// CausalProfile responds with the results of causal profiling experiments.
+// Profiling lasts for duration specified in seconds GET parameter, or for 60 seconds if not specified.
+// The package initialization registers it as /debug/pprof/trace.
+func CausalProfile(w http.ResponseWriter, r *http.Request) {
+	sec, _ := strconv.ParseInt(r.FormValue("seconds"), 10, 64)
+	if sec == 0 {
+		sec = 60
+	}
+
+	if durationExceedsWriteTimeout(r, float64(sec)) {
+		serveError(w, http.StatusBadRequest, "profile duration exceeds server's WriteTimeout")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if err := causalprof.Start(w); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Could not enable causal profiling: %s\n", err)
+		return
+	}
+	sleep(r, time.Duration(sec)*time.Second)
+	causalprof.Stop()
 }
 
 // Trace responds with the execution trace in binary form.

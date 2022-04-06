@@ -7,14 +7,6 @@ package work
 import (
 	"bufio"
 	"bytes"
-	"fmt"
-	"io"
-	"log"
-	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
-
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
@@ -24,6 +16,13 @@ import (
 	"cmd/internal/quoted"
 	"cmd/internal/sys"
 	"crypto/sha1"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 // The 'path' used for GOROOT_FINAL when -trimpath is specified
@@ -118,7 +117,7 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 		switch p.ImportPath {
 		case "bytes", "internal/poll", "net", "os":
 			fallthrough
-		case "runtime/metrics", "runtime/pprof", "runtime/trace":
+		case "runtime/metrics", "runtime/pprof", "runtime/trace", "runtime/causalprof":
 			fallthrough
 		case "sync", "syscall", "time":
 			extFiles++

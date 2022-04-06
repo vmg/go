@@ -855,11 +855,71 @@ func ready(gp *g, traceskip int, next bool) {
 		throw("bad g->status in ready")
 	}
 
+	pp := _g_.m.p.ptr()
+	// run any pending causalprof delays and mark the
+	// goroutine with the current delay count for this P
+	causalprofDelay(pp)
+	pdelay := atomic.Load64(&pp.causalprofdelay)
+	if pdelay >= gp.causalprofdelay {
+		gp.causalprofdelay = pdelay
+	}
+
 	// status is Gwaiting or Gscanwaiting, make Grunnable and put on runq
 	casgstatus(gp, _Gwaiting, _Grunnable)
 	runqput(_g_.m.p.ptr(), gp, next)
 	wakep()
 	releasem(mp)
+}
+
+// Delay M for causal profiling.
+// We're holding onto a P here, so it
+// effectively delays that P
+//
+// Note that this function is re-entrant
+// We need to delay Ps before readying Ps,
+// so this gets called both from the signal handler
+// and user code
+//
+// Since this gets called in the syscall path, it
+// needs to be nosplit
+//go:nosplit
+func causalprofDelay(pp *p) {
+	_g_ := getg()
+	if _g_ != _g_.m.g0 && _g_ != _g_.m.gsignal && _g_.m.locks == 0 {
+		throw("causalprof delay on with preemption possible")
+	}
+	if atomic.Load64(&causalprof.delaypersample) == 0 {
+		return
+	}
+
+	// check if we need to delay this M
+	curdelay := atomic.Load64(&causalprof.curdelay)
+	ignoreddelay := atomic.Load64(&causalprof.ignoredelay)
+
+	origdelay := atomic.Load64(&pp.causalprofdelay)
+	pdelay := origdelay
+	if pdelay < ignoreddelay {
+		pdelay = ignoreddelay
+	}
+
+	sleepfor := (int64(curdelay) - int64(pdelay)) / 1000
+	if sleepfor <= 0 {
+		return
+	}
+	// we've decided to sleep
+	// If a profiling signal comes along now
+	// it will have delayed the P and updated the counter
+	if !atomic.Cas64(&pp.causalprofdelay, origdelay, curdelay) {
+		return
+	}
+	begin := nanotime()
+	usleep(uint32(sleepfor))
+	end := nanotime()
+	// we might sleep more than we wanted
+	// we've already increased the delay amount earlier
+	// so only add the extra diff
+	sleptfor := (end - begin) - (sleepfor * 1000)
+	atomic.Xadd64(&pp.causalprofdelay, sleptfor)
 }
 
 // freezeStopWait is a large value that freezetheworld sets
@@ -2507,6 +2567,10 @@ func execute(gp *g, inheritTime bool) {
 	// M.
 	_g_.m.curg = gp
 	gp.m = _g_.m
+	pdelay := atomic.Load64(&_g_.m.p.ptr().causalprofdelay)
+	if gp.causalprofdelay > pdelay {
+		atomic.Xadd64(&_g_.m.p.ptr().causalprofdelay, int64(gp.causalprofdelay-pdelay))
+	}
 	casgstatus(gp, _Grunnable, _Grunning)
 	gp.waitsince = 0
 	gp.preempt = false
@@ -3249,6 +3313,16 @@ top:
 func dropg() {
 	_g_ := getg()
 
+	pp := _g_.m.p.ptr()
+	if pp != nil && pp.status == _Prunning {
+		// this G is holding onto a P and we're about
+		// to abandon it. Make sure we've executed our
+		// delays and mark the G with the amount of delays
+		// we've executed
+		causalprofDelay(pp)
+		_g_.m.curg.causalprofdelay = atomic.Load64(&pp.causalprofdelay)
+	}
+
 	setMNoWB(&_g_.m.curg.m, nil)
 	setGNoWB(&_g_.m.curg, nil)
 }
@@ -3499,6 +3573,11 @@ func goexit0(gp *g) {
 
 	dropg()
 
+	// dropg marks the causal profiling delay
+	// on the G, but this one is going to be freed anyway
+	// and we don't want a causal connection here.
+	gp.causalprofdelay = 0
+
 	if GOARCH == "wasm" { // no threads yet on wasm
 		gfput(_p_, gp)
 		schedule() // never returns
@@ -3641,6 +3720,13 @@ func reentersyscall(pc, sp uintptr) {
 		save(pc, sp)
 	}
 
+	// the m might lose the p it was running on.
+	// If we come back from the syscall and we grab an idle P
+	// we need to make sure that it receives the delay
+	// from the G
+	causalprofDelay(_g_.m.p.ptr())
+	_g_.causalprofdelay = atomic.Load64(&_g_.m.p.ptr().causalprofdelay)
+
 	_g_.m.syscalltick = _g_.m.p.ptr().syscalltick
 	_g_.sysblocktraced = true
 	pp := _g_.m.p.ptr()
@@ -3778,6 +3864,13 @@ func exitsyscall() {
 		_g_.m.p.ptr().syscalltick++
 		// We need to cas the status and scan before resuming...
 		casgstatus(_g_, _Gsyscall, _Grunning)
+
+		// If we managed to grab an idle P that hasn't had the most
+		// recent delay executed on it, grab the delay from the g
+		pdelay := atomic.Load64(&_g_.m.p.ptr().causalprofdelay)
+		if _g_.causalprofdelay > pdelay {
+			atomic.Xadd64(&_g_.m.p.ptr().causalprofdelay, int64(_g_.causalprofdelay-pdelay))
+		}
 
 		// Garbage collector isn't running (since we are),
 		// so okay to clear syscallsp.
@@ -4569,6 +4662,8 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 		}
 		cpuprof.add(tagPtr, stk[:n])
 	}
+
+	processCausalprof(gp, mp, stk[:n])
 	getg().m.mallocing--
 }
 
@@ -4608,6 +4703,65 @@ func setcpuprofilerate(hz int32) {
 	}
 
 	_g_.m.locks--
+}
+
+func processCausalprof(gp *g, mp *m, stk []uintptr) {
+	// causal profiling
+	// figure out if the gp that we got a signal for
+	// has a P attached. If not we don't need to do anything
+	// TODO(dmo): figure out if this is valid under concurrent
+	// executions
+	if mp.p == 0 {
+		return
+	}
+	pp := mp.p.ptr()
+	if pp.m.ptr() != mp || pp.status != _Prunning {
+		return
+	}
+	state := atomic.Load(&causalprof.state)
+	if state == causalprofStateInactive || state == causalProfStateStopped {
+		return
+	}
+	if state == causalprofStateAwaitingPC {
+		if len(stk) < 2 {
+			return
+		}
+		if !atomic.Cas(&causalprof.state, causalprofStateAwaitingPC, causalprofStateHavePC) {
+			return
+		}
+		chosenpc := stk[1]
+		atomic.Storeuintptr(&causalprof.pc, chosenpc)
+		notewakeup(&causalprof.wait)
+		return
+	}
+	// delay this m. Since we're holding onto the P
+	// it effectively delays the P
+	// TODO(dmo): figure out if this is true for windows
+	causalprofDelay(pp)
+	pc := atomic.Loaduintptr(&causalprof.pc)
+	atomic.Xadd64(&causalprof.allsamples, 1)
+	if !hascausalpc(stk, pc) {
+		return
+	}
+	// we have a line to instrument, so find out if we have a delay yet
+	delay := atomic.Load64(&causalprof.delaypersample)
+	if delay == 0 {
+		return
+	}
+
+	// we have a match and the experiment has been set up, so delay all other Ps
+	atomic.Xadd64(&causalprof.delaysamples, 1)
+	atomic.Xadd64(&causalprof.curdelay, int64(delay))
+	atomic.Xadd64(&pp.causalprofdelay, int64(delay))
+}
+
+func hascausalpc(stk []uintptr, cpc uintptr) bool {
+	for _, pc := range stk {
+		if pc == cpc {
+			return true
+		}
+	}
+	return false
 }
 
 // init initializes pp, which may be a freshly allocated p or a

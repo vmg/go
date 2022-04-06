@@ -502,10 +502,13 @@ var depsRules = `
 	FMT, compress/gzip, encoding/binary, text/tabwriter
 	< runtime/pprof;
 
+	FMT, runtime/pprof, time
+	< runtime/causalprof;
+
 	OS, compress/gzip, regexp
 	< internal/profile;
 
-	html, internal/profile, net/http, runtime/pprof, runtime/trace
+	html, internal/profile, net/http, runtime/causalprof, runtime/pprof, runtime/trace
 	< net/http/pprof;
 
 	# RPC
